@@ -30,6 +30,7 @@ message Reply {
   int64 timestamp = 1;   // Sender's Lamport clock when sending reply
   string from_id = 2;    // Who sent this reply
   string to_id = 3;      // Intended recipient's node ID
+  int64 request_timestamp = 4; // Timestamp of the original request
 }
 
 // -------------------------------

@@ -59,11 +59,11 @@ func (*Empty) Descriptor() ([]byte, []int) {
 
 // Request for critical section access.
 // In Ricart–Agrawala, REQUEST carries the Lamport timestamp and sender ID.
-// Priority is determined by (timestamp, from_id) with smaller being higher priority.
+// Priority is determined by timestamp from_id.
 type Request struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
-	Timestamp     int64                  `protobuf:"varint,1,opt,name=timestamp,proto3" json:"timestamp,omitempty"`        // Lamport logical clock value at send time
-	FromId        string                 `protobuf:"bytes,2,opt,name=from_id,json=fromId,proto3" json:"from_id,omitempty"` // Unique node ID (used as tie-breaker on equal timestamps)
+	Timestamp     int64                  `protobuf:"varint,1,opt,name=timestamp,proto3" json:"timestamp,omitempty"`        // Lamport clock value
+	FromId        string                 `protobuf:"bytes,2,opt,name=from_id,json=fromId,proto3" json:"from_id,omitempty"` // Unique node ID (used as tie-breaker when there is equal timestamps)
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -113,15 +113,16 @@ func (x *Request) GetFromId() string {
 }
 
 // Reply granting permission.
-// In Ricart–Agrawala, a REPLY means "you have my permission right now".
-// We still include a timestamp to keep clocks advancing on receive.
+// In Ricart–Agrawala, the REPLY means "you have my permission right now".
+// We should still include a timestamp to keep clocks advancing when receiving.
 type Reply struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Timestamp     int64                  `protobuf:"varint,1,opt,name=timestamp,proto3" json:"timestamp,omitempty"`        // Sender's Lamport clock when sending reply
-	FromId        string                 `protobuf:"bytes,2,opt,name=from_id,json=fromId,proto3" json:"from_id,omitempty"` // Who sent this reply
-	ToId          string                 `protobuf:"bytes,3,opt,name=to_id,json=toId,proto3" json:"to_id,omitempty"`       // Intended recipient's node ID
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state            protoimpl.MessageState `protogen:"open.v1"`
+	Timestamp        int64                  `protobuf:"varint,1,opt,name=timestamp,proto3" json:"timestamp,omitempty"`                                       // Sender's Lamport clock when sending reply
+	FromId           string                 `protobuf:"bytes,2,opt,name=from_id,json=fromId,proto3" json:"from_id,omitempty"`                                // Who sent this reply
+	ToId             string                 `protobuf:"bytes,3,opt,name=to_id,json=toId,proto3" json:"to_id,omitempty"`                                      // Intended recipient's node ID
+	RequestTimestamp int64                  `protobuf:"varint,4,opt,name=request_timestamp,json=requestTimestamp,proto3" json:"request_timestamp,omitempty"` // Timestamp of the original request
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *Reply) Reset() {
@@ -175,6 +176,13 @@ func (x *Reply) GetToId() string {
 	return ""
 }
 
+func (x *Reply) GetRequestTimestamp() int64 {
+	if x != nil {
+		return x.RequestTimestamp
+	}
+	return 0
+}
+
 var File_proto_ricartagrawala_proto protoreflect.FileDescriptor
 
 const file_proto_ricartagrawala_proto_rawDesc = "" +
@@ -183,11 +191,12 @@ const file_proto_ricartagrawala_proto_rawDesc = "" +
 	"\x05Empty\"@\n" +
 	"\aRequest\x12\x1c\n" +
 	"\ttimestamp\x18\x01 \x01(\x03R\ttimestamp\x12\x17\n" +
-	"\afrom_id\x18\x02 \x01(\tR\x06fromId\"S\n" +
+	"\afrom_id\x18\x02 \x01(\tR\x06fromId\"\x80\x01\n" +
 	"\x05Reply\x12\x1c\n" +
 	"\ttimestamp\x18\x01 \x01(\x03R\ttimestamp\x12\x17\n" +
 	"\afrom_id\x18\x02 \x01(\tR\x06fromId\x12\x13\n" +
-	"\x05to_id\x18\x03 \x01(\tR\x04toId2S\n" +
+	"\x05to_id\x18\x03 \x01(\tR\x04toId\x12+\n" +
+	"\x11request_timestamp\x18\x04 \x01(\x03R\x10requestTimestamp2S\n" +
 	"\tRAService\x12#\n" +
 	"\tRequestCS\x12\v.ra.Request\x1a\t.ra.Empty\x12!\n" +
 	"\tSendReply\x12\t.ra.Reply\x1a\t.ra.EmptyB\x1cZ\x1aricartagrawala/proto;protob\x06proto3"

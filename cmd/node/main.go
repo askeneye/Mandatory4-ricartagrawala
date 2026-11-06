@@ -26,92 +26,216 @@ import (
 // 4. Some logic to keep track of how many REPLYs it has received and from whom
 
 type State string
+
 const (
 	RELEASED State = "RELEASED"
-	WANTED State = "WANTED"
-	HELD State = "HELD"
+	WANTED   State = "WANTED"
+	HELD     State = "HELD"
 )
+
+type DeferredRequest struct {
+	FromID    string
+	Timestamp int64
+}
 
 type Node struct {
 	pb.UnimplementedRAServiceServer
 
-	mu 			sync.Mutex
-	nodeId 		string
-	nodePort 	string
-	peers 		map[string]pb.RAServiceClient
-	clock 		LamportClock
-	state 		State
+	mu       sync.Mutex
+	nodeId   string
+	nodePort string
+	peers    map[string]pb.RAServiceClient // Map of peer node IDs to their gRPC clients
+	clock    LamportClock
+	state    State // Current state of the node (RELEASED, WANTED, HELD)
 
-	requestTs 	int64
-	deferred 	[]string
-	replies		chan struct{}
+	requestTs int64 // Timestamp of the current request
+
+	deferred []DeferredRequest // Slice to hold deferred requests
+
+	replies     map[string]bool // Map to track which nodes have replied
+	replySignal chan struct{}   // Channel to signal when a reply is received
 }
 
 // Manage Ricart Agrawala logic
 
 func (n *Node) RequestCS(ctx context.Context, req *pb.Request) (*pb.Empty, error) {
 	n.mu.Lock()
-	
-	now := n.clock.Receive(req.Timestamp)
-	log.Printf("[%d] Node %s: request from %s with timestamp %d", now , n.nodeId, req.FromId, req.Timestamp)
 
-	priority := n.requestTs < req.Timestamp || (n.requestTs == req.Timestamp && n.nodeId < req.FromId)
+	now := n.clock.Receive(req.Timestamp)
+
+	log.Printf("[%d] Node %s: request from %s with timestamp %d",
+		now, n.nodeId, req.FromId, req.Timestamp)
+
+	priority := n.requestTs < req.Timestamp ||
+		(n.requestTs == req.Timestamp && n.nodeId < req.FromId)
+
+	log.Printf(
+		"[%d] Node %s: REQUEST from %s (ts=%d), state=%s, ownTs=%d, ownPriority=%t",
+		now,
+		n.nodeId,
+		req.FromId,
+		req.Timestamp,
+		n.state,
+		n.requestTs,
+		priority,
+	)
 
 	if n.state == HELD || (n.state == WANTED && priority) {
-		n.deferred = append(n.deferred, req.FromId) //Reply to later
-		log.Printf("[%d] Node %s: deferring reply to %s", now, n.nodeId, req.FromId)
+
+		n.deferred = append(n.deferred, DeferredRequest{ // Store the deferred request
+			FromID:    req.FromId,
+			Timestamp: req.Timestamp,
+		})
+
+		log.Printf("[%d] Node %s: deferring reply to %s",
+			now, n.nodeId, req.FromId)
+
 		n.mu.Unlock()
 		return &pb.Empty{}, nil
+
 	}
 
-	ts := n.clock.Tick()	
+	log.Printf(
+		"[%d] Node %s: granting permission to %s for request %d",
+		now, n.nodeId, req.FromId, req.Timestamp,
+	)
+
 	n.mu.Unlock()
 
-	go n.reply(req.FromId, ts)
+	go n.reply(req.FromId, req.Timestamp)
+
 	return &pb.Empty{}, nil
 }
 
-func (n *Node) reply(to string, ts int64) {
-	_, err := n.peers[to].SendReply(context.Background(), &pb.Reply{Timestamp: ts, FromId: n.nodeId})
+func (n *Node) reply(to string, requestTs int64) {
+
+	ts := n.clock.Tick()
+
+	client, exists := n.peers[to]
+	if !exists {
+		log.Printf("Node %s: unknown peer %s", n.nodeId, to)
+		return
+	}
+
+	_, err := client.SendReply(
+		context.Background(),
+		&pb.Reply{
+			Timestamp:        ts,
+			FromId:           n.nodeId,
+			ToId:             to,
+			RequestTimestamp: requestTs,
+		},
+	)
+
 	if err != nil {
-		log.Printf("Node %s: reply to %s failed: %v", n.nodeId, to, err)
+		log.Printf("Node %s: reply to %s failed: %v",
+			n.nodeId, to, err)
 	}
 }
 
 func (n *Node) SendReply(ctx context.Context, rep *pb.Reply) (*pb.Empty, error) {
 
-	now := n.clock.Receive(rep.Timestamp)
-	log.Printf("[%d] Node %s: got reply from %s", now, n.nodeId, rep.FromId)
+	n.mu.Lock()
+	defer n.mu.Unlock()
 
-	n.replies <- struct{}{}
+	now := n.clock.Receive(rep.Timestamp)
+
+	// Check that the reply is intended for this node
+	if rep.ToId != n.nodeId {
+		return &pb.Empty{}, nil
+	}
+
+	// Check that the sender is a known peer
+	if _, exists := n.peers[rep.FromId]; !exists {
+		return &pb.Empty{}, nil
+	}
+
+	// Only accept replies while requesting access
+	if n.state != WANTED {
+		return &pb.Empty{}, nil
+	}
+
+	// Ignore replies to older requests
+	// This is the crucial check to ensure the reply corresponds to the current request
+	if rep.RequestTimestamp != n.requestTs {
+		return &pb.Empty{}, nil
+	}
+
+	// Ignore duplicate replies
+	if n.replies[rep.FromId] {
+		return &pb.Empty{}, nil
+	}
+
+	n.replies[rep.FromId] = true
+
+	log.Printf("[%d] Node %s: received reply from %s (%d/%d)",
+		now, n.nodeId, rep.FromId,
+		len(n.replies), len(n.peers))
+
+	// Notify the waiting requestAccess() method.
+	select {
+	case n.replySignal <- struct{}{}:
+	default:
+	}
+
 	return &pb.Empty{}, nil
 }
 
 func (n *Node) requestAccess() {
+
 	n.mu.Lock()
+
 	n.state = WANTED
 	n.requestTs = n.clock.Tick()
+	n.replies = make(map[string]bool)
+
 	ts := n.requestTs
+
 	n.mu.Unlock()
 
-	log.Printf("[%d] Node %s: state WANTED, sending REQUEST (ts=%d) to all peers", ts, n.nodeId, ts)
+	log.Printf("[%d] Node %s: state WANTED, requesting CS",
+		ts, n.nodeId)
+
+	var wg sync.WaitGroup
 
 	for id, client := range n.peers {
-		_, err := client.RequestCS(context.Background(), 
-		&pb.Request{Timestamp: ts, FromId: n.nodeId},
-		grpc.WaitForReady(true))
-		if err != nil {
-			log.Printf("Node %s: request to %s failed %v", n.nodeId, id, err)
+		wg.Add(1)
+
+		go func(id string, client pb.RAServiceClient) {
+			defer wg.Done()
+
+			_, err := client.RequestCS(
+				context.Background(),
+				&pb.Request{
+					Timestamp: ts,
+					FromId:    n.nodeId,
+				},
+				grpc.WaitForReady(true),
+			)
+
+			if err != nil {
+				log.Printf("Node %s: request to %s failed: %v",
+					n.nodeId, id, err)
+			}
+		}(id, client)
+	}
+
+	wg.Wait()
+
+	// Wait for permission from every peer.
+	for {
+		n.mu.Lock()
+
+		if len(n.replies) == len(n.peers) {
+			n.state = HELD
+			n.mu.Unlock()
+			break
 		}
-	}
 
-	for i := 0; i < len(n.peers); i++ {
-		<-n.replies
-	}
+		n.mu.Unlock()
 
-	n.mu.Lock()
-	n.state = HELD
-	n.mu.Unlock()
+		<-n.replySignal
+	}
 }
 
 func (n *Node) criticalSection() {
@@ -121,28 +245,31 @@ func (n *Node) criticalSection() {
 }
 
 func (n *Node) releaseAccess() {
+
 	n.mu.Lock()
+
 	n.state = RELEASED
 	toReply := n.deferred
 	n.deferred = nil
-	ts := n.clock.Tick()
+
 	n.mu.Unlock()
 
-	log.Printf("[%d] Node %s: state RELEASED, sending deferred replies to %v", ts, n.nodeId, toReply)
+	log.Printf("Node %s: state RELEASED, sending deferred replies",
+		n.nodeId)
 
-	for _, id := range toReply {
-		n.reply(id, ts)
+	for _, req := range toReply {
+		n.reply(req.FromID, req.Timestamp)
 	}
 }
 
 func main() {
 	myId := os.Args[1]
-	
+
 	allNodes := map[string]string{
-		"1" : "localthost:5051",
-		"2" : "localthost:5052",
-		"3" : "localthost:5053",
-		"4" : "localthost:5054",
+		"1": "localhost:5051",
+		"2": "localhost:5052",
+		"3": "localhost:5053",
+		"4": "localhost:5054",
 	}
 
 	myAdrr, ok := allNodes[myId]
@@ -151,10 +278,12 @@ func main() {
 	}
 
 	n := &Node{
-		nodeId: myId,
-		nodePort: myAdrr,
-		peers: make(map[string]pb.RAServiceClient),
-		state: RELEASED,
+		nodeId:      myId,
+		nodePort:    myAdrr,
+		peers:       make(map[string]pb.RAServiceClient),
+		state:       RELEASED,
+		replies:     make(map[string]bool),
+		replySignal: make(chan struct{}, 1),
 	}
 
 	//Creating rest of clients (LAZY: they don't need to be up yet)
@@ -167,8 +296,7 @@ func main() {
 			log.Fatalf("Node %s: could not create client for %s: %v", myId, id, err)
 		}
 		n.peers[id] = pb.NewRAServiceClient(conn)
-	} 
-	n.replies = make(chan struct{}, len(n.peers))
+	}
 
 	lis, err := net.Listen("tcp", myAdrr)
 	if err != nil {
@@ -178,8 +306,7 @@ func main() {
 	pb.RegisterRAServiceServer(s, n)
 
 	go func() {
-		if err := s.Serve(lis)
-		err != nil {
+		if err := s.Serve(lis); err != nil {
 			log.Fatalf("Node %s: server stopped: %v", myId, err)
 		}
 	}()
@@ -187,7 +314,7 @@ func main() {
 	log.Printf("Node %s: listening on %s with %d peers", myId, myAdrr, len(n.peers))
 
 	for {
-		time.Sleep(time.Second * 2)
+		time.Sleep(time.Second * 5)
 		n.requestAccess()
 		n.criticalSection()
 		n.releaseAccess()
