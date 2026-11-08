@@ -12,5 +12,5 @@ All 4 nodes must be running, as a node only enters the CS after it has recieved 
 Each node has to be run from its own terminal
 
 ## Run node(s) from terminal
-From the project root, where <id> can be 1 through 4:
-go run ./cmd/node <id>
+From the project root, where `<id>` can be 1 through 4:
+go run ./cmd/node `<id>`
